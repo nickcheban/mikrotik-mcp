@@ -40,6 +40,13 @@ uvicorn server:app --host 0.0.0.0 --port 8001
 
 Systemd unit example: [`deploy/mikrotik-mcp.service`](deploy/mikrotik-mcp.service).
 
+**Docker:**
+
+```bash
+docker build -t mikrotik-mcp .
+docker run -p 8001:8001 --env-file .env mikrotik-mcp
+```
+
 **On the router:** create a dedicated user in a read-only group (`/user group add name=ai-mcp-group policy=read,api,!write,!policy,!test,!winbox,!password,!web,!reboot,!ftp,!sniff,!sensitive,!romon`), don't grant `write`/`policy`. Even if the server itself is compromised, access stays limited at the RouterOS level.
 
 ## Security model
