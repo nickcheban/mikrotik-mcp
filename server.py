@@ -17,10 +17,10 @@ DOMAIN        = os.getenv("DOMAIN", "mikrotik-mcp.example.com")
 
 app = FastAPI()
 
-# ─── RouterOS API клиент ───────────────────────────────────────────────────────
+# ─── RouterOS API client ───────────────────────────────────────────────────────
 
 class RouterOSAPI:
-    """Минимальный синхронный клиент RouterOS API (порт 8728)."""
+    """Minimal synchronous RouterOS API client (port 8728)."""
 
     def __init__(self, host, port, username, password, timeout=10):
         self.host = host
@@ -51,7 +51,7 @@ class RouterOSAPI:
     def __exit__(self, *args):
         self.close()
 
-    # ── кодирование длин ──────────────────────────────────────────────────────
+    # ── length encoding ───────────────────────────────────────────────────────
 
     def _encode_length(self, length):
         if length < 0x80:
@@ -87,16 +87,16 @@ class RouterOSAPI:
             return struct.unpack("!I", rest)[0]
 
     def _recv_exact(self, n):
-        """Гарантированно читает ровно n байт или выбрасывает исключение."""
+        """Reads exactly n bytes or raises."""
         data = b""
         while len(data) < n:
             chunk = self.sock.recv(n - len(data))
             if not chunk:
-                raise ConnectionError("RouterOS API: соединение закрыто")
+                raise ConnectionError("RouterOS API: connection closed")
             data += chunk
         return data
 
-    # ── протокол ──────────────────────────────────────────────────────────────
+    # ── protocol ──────────────────────────────────────────────────────────────
 
     def _write_sentence(self, words):
         data = b""
@@ -121,7 +121,7 @@ class RouterOSAPI:
         response = self._read_sentence()
         if response and response[0] == "!done":
             return
-        # Старый challenge-based логин
+        # Legacy challenge-based login
         challenge = None
         for word in response:
             if word.startswith("=ret="):
@@ -135,7 +135,7 @@ class RouterOSAPI:
             self._read_sentence()
 
     def _read_records(self):
-        """Читает !re-записи до !done. Общий цикл для query() и query_words()."""
+        """Reads !re records up to !done. Shared loop for query() and query_words()."""
         results = []
         while True:
             sentence = self._read_sentence()
@@ -157,7 +157,7 @@ class RouterOSAPI:
         return results
 
     def query(self, command, params=None, filters=None):
-        """Выполнить команду и вернуть список словарей."""
+        """Runs a command and returns a list of dicts."""
         words = [command]
         if params:
             for k, v in params.items():
@@ -169,13 +169,13 @@ class RouterOSAPI:
         return self._read_records()
 
     def query_words(self, words):
-        """Как query(), но принимает уже готовый список слов — нужно для команд
-        с флагами без значения (например 'once' у /interface/monitor-traffic)."""
+        """Like query(), but takes a pre-built word list — needed for commands
+        with value-less flags (e.g. 'once' on /interface/monitor-traffic)."""
         self._write_sentence(words)
         return self._read_records()
 
     def run(self, command, params=None):
-        """Выполнить команду без возврата данных (add/remove/set)."""
+        """Runs a command without returning data (add/remove/set)."""
         words = [command]
         if params:
             for k, v in params.items():
@@ -196,147 +196,147 @@ def get_api():
     return RouterOSAPI(MIKROTIK_HOST, MIKROTIK_PORT, MIKROTIK_USER, MIKROTIK_PASS)
 
 
-# ─── Описание инструментов ────────────────────────────────────────────────────
+# ─── Tool definitions ──────────────────────────────────────────────────────────
 
 TOOLS = [
     {
         "name": "system_info",
-        "description": "Информация о системе: модель, версия RouterOS, uptime, CPU, RAM",
+        "description": "System info: model, RouterOS version, uptime, CPU, RAM",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_interfaces",
-        "description": "Список сетевых интерфейсов с их статусом и комментариями",
+        "description": "List of network interfaces with their status and comments",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_dhcp_leases",
-        "description": "Список DHCP lease — кто подключён к сети. Можно фильтровать по серверу.",
+        "description": "List of DHCP leases — who's connected to the network. Can be filtered by server.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "Имя DHCP сервера. Если не указан — все."}
+                "server": {"type": "string", "description": "DHCP server name. If not specified, all servers."}
             },
             "required": []
         }
     },
     {
         "name": "get_firewall_rules",
-        "description": "Правила файрвола (filter). Можно фильтровать по chain (input/forward/output).",
+        "description": "Firewall filter rules. Can be filtered by chain (input/forward/output).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "chain": {"type": "string", "description": "Цепочка: input, forward, output. Если не указана — все."}
+                "chain": {"type": "string", "description": "Chain: input, forward, output. If not specified, all chains."}
             },
             "required": []
         }
     },
     {
         "name": "get_nat_rules",
-        "description": "Правила NAT (dstnat и srcnat)",
+        "description": "NAT rules (dstnat and srcnat)",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_address_lists",
-        "description": "Содержимое address-list. Можно указать конкретный список.",
+        "description": "Contents of an address-list. Can specify a particular list.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "list": {"type": "string", "description": "Имя списка, например blocked, allowed_internet. Если не указан — все."}
+                "list": {"type": "string", "description": "List name, e.g. blocked, allowed_internet. If not specified, all lists."}
             },
             "required": []
         }
     },
     {
         "name": "get_queues",
-        "description": "Simple Queues — ограничения скорости для устройств и интерфейсов",
+        "description": "Simple Queues — bandwidth limits for devices and interfaces",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_routes",
-        "description": "Таблица маршрутизации",
+        "description": "Routing table",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "add_to_address_list",
-        "description": "Добавить IP адрес в address-list на Микротике",
+        "description": "Add an IP address to an address-list on the MikroTik",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "address": {"type": "string", "description": "IP адрес или подсеть, например 1.2.3.4 или 192.168.1.0/24"},
-                "list": {"type": "string", "description": "Имя списка, например blocked"},
-                "comment": {"type": "string", "description": "Комментарий (необязательно)"},
-                "timeout": {"type": "string", "description": "Время жизни записи, например 1h, 1d (необязательно)"}
+                "address": {"type": "string", "description": "IP address or subnet, e.g. 1.2.3.4 or 192.168.1.0/24"},
+                "list": {"type": "string", "description": "List name, e.g. blocked"},
+                "comment": {"type": "string", "description": "Comment (optional)"},
+                "timeout": {"type": "string", "description": "Entry TTL, e.g. 1h, 1d (optional)"}
             },
             "required": ["address", "list"]
         }
     },
     {
         "name": "remove_from_address_list",
-        "description": "Удалить IP адрес из address-list на Микротике",
+        "description": "Remove an IP address from an address-list on the MikroTik",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "address": {"type": "string", "description": "IP адрес для удаления"},
-                "list": {"type": "string", "description": "Имя списка"}
+                "address": {"type": "string", "description": "IP address to remove"},
+                "list": {"type": "string", "description": "List name"}
             },
             "required": ["address", "list"]
         }
     },
     {
         "name": "get_logs",
-        "description": "Последние записи из лога Микротика",
+        "description": "Recent MikroTik log entries",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "limit": {"type": "number", "description": "Количество записей (по умолчанию 50)"}
+                "limit": {"type": "number", "description": "Number of entries (default 50)"}
             },
             "required": []
         }
     },
     {
         "name": "execute_command",
-        "description": "Выполнить RouterOS команду для чтения/диагностики. Только read-only команды. Например: /ip/firewall/filter/print или /ping address=8.8.8.8 count=3",
+        "description": "Run a RouterOS command for reading/diagnostics. Read-only commands only. Example: /ip/firewall/filter/print or /ping address=8.8.8.8 count=3",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "RouterOS команда"}
+                "command": {"type": "string", "description": "RouterOS command"}
             },
             "required": ["command"]
         }
     },
     {
         "name": "get_wireguard",
-        "description": "WireGuard: список интерфейсов (listen-port, public-key) и пиров (endpoint, allowed-address, последний handshake, rx/tx)",
+        "description": "WireGuard: interfaces (listen-port, public-key) and peers (endpoint, allowed-address, last handshake, rx/tx)",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_dns_static",
-        "description": "Список статических DNS-записей (/ip/dns/static) на Микротике",
+        "description": "List of static DNS entries (/ip/dns/static) on the MikroTik",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_interface_traffic",
-        "description": "Мгновенный снимок текущей загрузки интерфейсов (бит/с, пакетов/с) — для диагностики 'почему тормозит интернет прямо сейчас'",
+        "description": "Instant snapshot of current interface throughput (bits/s, packets/s) — for diagnosing 'why is the internet slow right now'",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "interface": {"type": "string", "description": "Имя интерфейса или список через запятую, например ether1,wlan1. Если не указано — все активные интерфейсы (максимум 8)."}
+                "interface": {"type": "string", "description": "Interface name or comma-separated list, e.g. ether1,wlan1. If not specified, all active interfaces (max 8)."}
             },
             "required": []
         }
     },
     {
         "name": "config_snapshot",
-        "description": "JSON-снимок ключевых разделов конфигурации (интерфейсы, firewall filter/NAT, address-lists, DHCP lease, маршруты, WireGuard, статический DNS) — для сравнения 'было/стало' до и после изменений. Это не бинарный RouterOS-бэкап, а читаемый JSON-снимок.",
+        "description": "JSON snapshot of key config sections (interfaces, firewall filter/NAT, address-lists, DHCP leases, routes, WireGuard, static DNS) — for diffing 'before/after' around manual changes. This is not a native RouterOS backup file, just a readable JSON snapshot.",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     }
 ]
 
 
-# ─── Логика инструментов ──────────────────────────────────────────────────────
+# ─── Tool logic ────────────────────────────────────────────────────────────────
 
-# Whitelist разрешённых корневых команд для execute_command
+# Whitelist of allowed root commands for execute_command
 ALLOWED_READ_COMMANDS = {
     "/ip/firewall/filter/print",
     "/ip/firewall/nat/print",
@@ -367,11 +367,11 @@ ALLOWED_READ_COMMANDS = {
 }
 
 def validate_ip(address):
-    """Проверяет что адрес — валидный IP или подсеть."""
+    """Checks that the address is a valid IP or subnet."""
     try:
         ipaddress.ip_network(address, strict=False)
     except ValueError:
-        raise ValueError(f"Некорректный IP адрес или подсеть: {address}")
+        raise ValueError(f"Invalid IP address or subnet: {address}")
 
 
 def run_tool(name, args):
@@ -569,18 +569,18 @@ def run_tool(name, args):
 
         elif name == "execute_command":
             command = args["command"].strip()
-            # Определяем базовую команду (первое слово)
+            # Determine the base command (first word)
             base_cmd = command.split()[0].rstrip("/")
-            # Нормализуем: /ping → /ping, /ip/firewall/filter/print → /ip/firewall/filter/print
+            # Normalize: /ping -> /ping, /ip/firewall/filter/print -> /ip/firewall/filter/print
             normalized = "/" + base_cmd.lstrip("/")
 
             if normalized not in ALLOWED_READ_COMMANDS:
                 return {
-                    "error": f"Команда не в whitelist: {normalized}",
+                    "error": f"Command not in whitelist: {normalized}",
                     "allowed": sorted(ALLOWED_READ_COMMANDS)
                 }
 
-            # Парсим аргументы: ключ=значение → словарь params
+            # Parse arguments: key=value -> params dict
             words  = command.split()
             params = {}
             for word in words[1:]:
@@ -648,7 +648,7 @@ def run_tool(name, args):
                 names = [i.get("name") for i in ifaces if i.get("disabled", "false") != "true" and i.get("name")]
                 iface = ",".join(names[:8])
             if not iface:
-                return {"error": "Нет доступных интерфейсов для снимка трафика"}
+                return {"error": "No interfaces available for a traffic snapshot"}
             records = api.query_words(["/interface/monitor-traffic", f"=interface={iface}", "=once="])
             return {
                 "interfaces": [
@@ -675,7 +675,7 @@ def run_tool(name, args):
             wg_peers    = api.query("/interface/wireguard/peers/print")
             dns_static  = api.query("/ip/dns/static/print")
             return {
-                "note": "JSON-снимок ключевых разделов конфигурации (не бинарный RouterOS backup)",
+                "note": "JSON snapshot of key config sections (not a native RouterOS backup)",
                 "interfaces":         ifaces,
                 "firewall_filter":    fw_filter,
                 "firewall_nat":       fw_nat,
@@ -697,7 +697,7 @@ STATIC_TOKEN = os.getenv("MCP_SECRET", "")
 
 def check_auth(request: Request):
     if not MCP_SECRET:
-        return  # В dev-режиме без секрета — пропускаем
+        return  # No secret configured — skip the check (dev mode)
     auth = request.headers.get("Authorization", "")
     allowed = {f"Bearer {MCP_SECRET}", f"Bearer {STATIC_TOKEN}"}
     if auth not in allowed:
@@ -756,7 +756,7 @@ async def mcp_handler(request: Request):
         tool_name = params.get("name")
         tool_args = params.get("arguments", {})
         try:
-            # Синхронный run_tool выполняется в thread pool, не блокируя event loop
+            # Synchronous run_tool runs in a thread pool, so it doesn't block the event loop
             result = await run_in_threadpool(run_tool, tool_name, tool_args)
             return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {
                 "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]
@@ -774,7 +774,7 @@ async def mcp_handler(request: Request):
         }})
 
 
-# ─── OAuth заглушка (требуется для подключения через claude.ai) ───────────────
+# ─── OAuth stub (needed for connecting via claude.ai) ──────────────────────────
 
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_metadata():
