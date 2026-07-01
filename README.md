@@ -1,5 +1,8 @@
 # mikrotik-mcp
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+
 MCP-сервер для MikroTik RouterOS. Общается с роутером напрямую по бинарному RouterOS API (порт 8728) — минимальная самописная реализация протокола (кодирование длин, sentence-based обмен, MD5-challenge login для старых версий), без сторонних библиотек уровня RouterOS API.
 
 **Намеренно read-only** (за исключением управления одним конкретным address-list — см. ниже). Это осознанное архитектурное решение: роутер — самый чувствительный узел сети, и LLM не должна иметь возможность менять firewall/NAT/маршрутизацию напрямую.
@@ -45,6 +48,7 @@ Systemd-юнит — пример в [`deploy/mikrotik-mcp.service`](deploy/mikr
 - `/.well-known/oauth-authorization-server` + `/oauth/authorize` + `/oauth/token` — совместимая заглушка для custom-коннекторов claude.ai, у которых [нет поддержки статического API-ключа](https://claude.com/docs/connectors/building/authentication) — только полноценный OAuth 2.1 или отсутствие авторизации вовсе. Реальную защиту даёт Bearer-токен на `/mcp`, а не этот хендшейк. Через Claude Code CLI (`claude mcp add --header ...`) эта заглушка не нужна вовсе.
 - `redirect_uri` в `/oauth/authorize` — allowlist (`claude.ai`, `anthropic.com`, `console.anthropic.com`, `localhost`).
 - `execute_command` работает строго через whitelist корневых команд в коде — нельзя выполнить произвольную write-команду через этот инструмент, даже если попытаться.
+- **Транспорт**: сервер сам не терминирует TLS — слушает голый HTTP. Если он доступен за пределами localhost/доверенной LAN (а тем более если вы подключаете его как custom-коннектор в claude.ai — там HTTPS обязателен), обязательно ставьте перед ним TLS-терминацию: Cloudflare Tunnel, Tailscale Funnel, nginx/Caddy + Let's Encrypt и т.п. Без этого Bearer-токен (`MCP_SECRET`) в заголовке `Authorization` уходит в сеть открытым текстом.
 
 ## Требования
 
