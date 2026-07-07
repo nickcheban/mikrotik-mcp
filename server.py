@@ -4,6 +4,8 @@ import socket
 import hashlib
 import struct
 import ipaddress
+import threading
+import time
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
 from fastapi.concurrency import run_in_threadpool
@@ -192,8 +194,58 @@ class RouterOSAPI:
                 raise Exception(f"RouterOS error: {' '.join(sentence[1:])}")
 
 
+_api_lock = threading.Lock()
+_api_instance = None
+_api_last_used = 0.0
+_API_IDLE_LIMIT = 480  # seconds — headroom below the router's own inactivity-timeout for this user
+
+
+class _PersistentApiHandle:
+    """Context manager that reuses one long-lived connection to the RouterOS API
+    instead of connect+login/close on every tool call (that pattern floods the
+    router's /log with a login/logout pair several times a second)."""
+
+    def __enter__(self):
+        global _api_instance, _api_last_used
+        _api_lock.acquire()
+        try:
+            now = time.time()
+            if _api_instance is not None and (now - _api_last_used) > _API_IDLE_LIMIT:
+                _api_instance.close()
+                _api_instance = None
+            if _api_instance is None:
+                _api_instance = RouterOSAPI(MIKROTIK_HOST, MIKROTIK_PORT, MIKROTIK_USER, MIKROTIK_PASS)
+                _api_instance.connect()
+            _api_last_used = now
+            return _api_instance
+        except Exception:
+            # __enter__ failed → __exit__ will NOT be called (that's how the
+            # `with` protocol works), so the lock must be released here or it
+            # stays held forever and every subsequent tool call (routed through
+            # run_in_threadpool) hangs until the whole thread pool is exhausted
+            # and the service stops responding entirely.
+            if _api_instance:
+                try:
+                    _api_instance.close()
+                except Exception:
+                    pass
+            _api_instance = None
+            _api_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        global _api_instance
+        # Connection died (socket/timeout) — drop it so the next call reconnects
+        if exc_type is not None and issubclass(exc_type, (ConnectionError, OSError, socket.timeout)):
+            if _api_instance:
+                _api_instance.close()
+            _api_instance = None
+        _api_lock.release()
+        return False  # don't suppress the exception
+
+
 def get_api():
-    return RouterOSAPI(MIKROTIK_HOST, MIKROTIK_PORT, MIKROTIK_USER, MIKROTIK_PASS)
+    return _PersistentApiHandle()
 
 
 # ─── Tool definitions ──────────────────────────────────────────────────────────
@@ -718,7 +770,7 @@ def validate_redirect_uri(uri: str):
 
 @app.get("/")
 async def root():
-    return {"status": "mikrotik-mcp running", "version": "1.1.0", "host": MIKROTIK_HOST}
+    return {"status": "mikrotik-mcp running", "version": "1.2.0", "host": MIKROTIK_HOST}
 
 
 @app.get("/mcp")
@@ -727,7 +779,7 @@ async def mcp_info(request: Request):
     return {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "mikrotik-mcp", "version": "1.1.0"}
+        "serverInfo": {"name": "mikrotik-mcp", "version": "1.2.0"}
     }
 
 
@@ -742,7 +794,7 @@ async def mcp_handler(request: Request):
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "mikrotik-mcp", "version": "1.1.0"}
+            "serverInfo": {"name": "mikrotik-mcp", "version": "1.2.0"}
         }})
 
     elif method == "notifications/initialized":
