@@ -770,7 +770,7 @@ def validate_redirect_uri(uri: str):
 
 @app.get("/")
 async def root():
-    return {"status": "mikrotik-mcp running", "version": "1.2.0", "host": MIKROTIK_HOST}
+    return {"status": "mikrotik-mcp running", "version": "1.3.0", "host": MIKROTIK_HOST}
 
 
 @app.get("/mcp")
@@ -779,7 +779,7 @@ async def mcp_info(request: Request):
     return {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "mikrotik-mcp", "version": "1.2.0"}
+        "serverInfo": {"name": "mikrotik-mcp", "version": "1.3.0"}
     }
 
 
@@ -794,7 +794,7 @@ async def mcp_handler(request: Request):
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "mikrotik-mcp", "version": "1.2.0"}
+            "serverInfo": {"name": "mikrotik-mcp", "version": "1.3.0"}
         }})
 
     elif method == "notifications/initialized":
@@ -811,12 +811,18 @@ async def mcp_handler(request: Request):
             # Synchronous run_tool runs in a thread pool, so it doesn't block the event loop
             result = await run_in_threadpool(run_tool, tool_name, tool_args)
             return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {
-                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]
+                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}],
+                "isError": False
             }})
         except Exception as e:
-            return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {
-                "code": -32603,
-                "message": str(e)
+            # Tool execution errors are reported inside a normal result with
+            # isError: true, per the MCP spec -- not as a JSON-RPC protocol
+            # error (-32603 is meant for transport-level failures). This gives
+            # the caller (Claude) the actual error text as a tool result it
+            # can reason about, same as pihole-mcp/ruckus-mcp already do.
+            return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": [{"type": "text", "text": f"Error: {str(e)}"}],
+                "isError": True
             }})
 
     else:
