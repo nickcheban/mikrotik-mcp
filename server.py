@@ -1,6 +1,8 @@
 import os
 import json
 import shlex
+import secrets
+import time
 import ipaddress
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
@@ -89,26 +91,28 @@ TOOLS = [
     },
     {
         "name": "add_to_address_list",
-        "description": "Add an IP address to an address-list on the MikroTik",
+        "description": "Add an IP address to an address-list on the MikroTik. Two-step call: the first call (without confirm_token) changes nothing and returns a preview + confirm_token; call again with that confirm_token to apply.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "address": {"type": "string", "description": "IP address or subnet, e.g. 1.2.3.4 or 192.168.1.0/24"},
                 "list": {"type": "string", "description": "List name, e.g. blocked"},
                 "comment": {"type": "string", "description": "Comment (optional)"},
-                "timeout": {"type": "string", "description": "Entry TTL, e.g. 1h, 1d (optional)"}
+                "timeout": {"type": "string", "description": "Entry TTL, e.g. 1h, 1d (optional)"},
+                "confirm_token": {"type": "string", "description": "Token from this tool's own preview on a previous call -- applies the change. Don't pass this on the first call."}
             },
             "required": ["address", "list"]
         }
     },
     {
         "name": "remove_from_address_list",
-        "description": "Remove an IP address from an address-list on the MikroTik",
+        "description": "Remove an IP address from an address-list on the MikroTik. Two-step call: the first call (without confirm_token) changes nothing and returns a preview + confirm_token; call again with that confirm_token to apply.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "address": {"type": "string", "description": "IP address to remove"},
-                "list": {"type": "string", "description": "List name"}
+                "list": {"type": "string", "description": "List name"},
+                "confirm_token": {"type": "string", "description": "Token from this tool's own preview on a previous call -- applies the change. Don't pass this on the first call."}
             },
             "required": ["address", "list"]
         }
@@ -204,7 +208,72 @@ def validate_ip(address):
         raise ValueError(f"Invalid IP address or subnet: {address}")
 
 
+# ─── Guardrail for write tools: dry-run preview + confirmation ────────────────
+# Pattern borrowed from MikroMCP (github.com/AliKarami/MikroMCP): the first
+# call to a write tool changes nothing on the router and returns a preview +
+# a one-time token; a second call with that token executes exactly what was
+# previewed (not whatever args the second call happens to carry -- this
+# guards against a mismatch between what was confirmed and what actually
+# gets applied). Tokens live in process memory (lost on restart) -- that's
+# fine, confirmation is meant to happen right after the preview, not hours
+# later.
+
+_CONFIRM_TTL_SECONDS = 120
+_pending_confirmations = {}
+
+WRITE_TOOLS_WITH_CONFIRMATION = {"add_to_address_list", "remove_from_address_list"}
+
+
+def _register_pending_confirmation(tool_name, args):
+    now = time.time()
+    expired = [t for t, entry in _pending_confirmations.items() if entry["expires"] < now]
+    for t in expired:
+        del _pending_confirmations[t]
+    token = secrets.token_urlsafe(8)
+    _pending_confirmations[token] = {"tool": tool_name, "args": args, "expires": now + _CONFIRM_TTL_SECONDS}
+    return token
+
+
+def _resolve_pending_confirmation(tool_name, token):
+    entry = _pending_confirmations.pop(token, None)
+    if entry is None:
+        raise ValueError("Unknown or already-used confirm_token -- call the tool again without confirm_token to get a fresh preview")
+    if entry["expires"] < time.time():
+        raise ValueError(f"confirm_token expired (valid for {_CONFIRM_TTL_SECONDS}s) -- call the tool again without confirm_token")
+    if entry["tool"] != tool_name:
+        raise ValueError("confirm_token was issued for a different tool")
+    return entry["args"]
+
+
+def _preview_address_list_change(name, args):
+    if "address" not in args or "list" not in args:
+        raise ValueError("'address' and 'list' are required")
+    address = args["address"]
+    lst = args["list"]
+    validate_ip(address)
+    if name == "add_to_address_list":
+        comment = args.get("comment", "added by ai-mcp")
+        timeout = args.get("timeout", "")
+        extra = f", timeout={timeout}" if timeout else ""
+        return f"Will add {address} to address-list '{lst}' (comment='{comment}'{extra})"
+    else:
+        return f"Will remove {address} from address-list '{lst}' (all matching entries found at execution time)"
+
+
 def run_tool(name, args):
+    if name in WRITE_TOOLS_WITH_CONFIRMATION:
+        confirm_token = args.get("confirm_token")
+        if confirm_token:
+            args = _resolve_pending_confirmation(name, confirm_token)
+        else:
+            preview = _preview_address_list_change(name, args)
+            token = _register_pending_confirmation(name, args)
+            return {
+                "preview": preview,
+                "confirm_token": token,
+                "expires_in_seconds": _CONFIRM_TTL_SECONDS,
+                "note": "Nothing was changed on the router. Call this same tool again with this confirm_token to apply it.",
+            }
     with get_api() as api:
 
         if name == "system_info":
@@ -568,7 +637,7 @@ def validate_redirect_uri(uri: str):
 
 @app.get("/")
 async def root():
-    return {"status": "mikrotik-mcp running", "version": "1.4.0", "host": MIKROTIK_HOST}
+    return {"status": "mikrotik-mcp running", "version": "1.5.0", "host": MIKROTIK_HOST}
 
 
 @app.get("/mcp")
@@ -577,7 +646,7 @@ async def mcp_info(request: Request):
     return {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "mikrotik-mcp", "version": "1.4.0"}
+        "serverInfo": {"name": "mikrotik-mcp", "version": "1.5.0"}
     }
 
 
@@ -592,7 +661,7 @@ async def mcp_handler(request: Request):
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "mikrotik-mcp", "version": "1.4.0"}
+            "serverInfo": {"name": "mikrotik-mcp", "version": "1.5.0"}
         }})
 
     elif method == "notifications/initialized":
