@@ -1,14 +1,12 @@
 import os
 import json
-import socket
-import hashlib
-import struct
+import shlex
 import ipaddress
-import threading
-import time
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
 from fastapi.concurrency import run_in_threadpool
+
+from routeros_client import PersistentRouterOSHandle
 
 MIKROTIK_HOST = os.getenv("MIKROTIK_HOST", "192.168.1.1")
 MIKROTIK_PORT = int(os.getenv("MIKROTIK_PORT", "8728"))
@@ -19,233 +17,13 @@ DOMAIN        = os.getenv("DOMAIN", "mikrotik-mcp.example.com")
 
 app = FastAPI()
 
-# ─── RouterOS API client ───────────────────────────────────────────────────────
+# ─── RouterOS API ──────────────────────────────────────────────────────────────
+# Protocol client and persistent connection live in routeros_client.py.
 
-class RouterOSAPI:
-    """Minimal synchronous RouterOS API client (port 8728)."""
-
-    def __init__(self, host, port, username, password, timeout=10):
-        self.host = host
-        self.port = port
-        self.username = username
-        self.password = password
-        self.timeout = timeout
-        self.sock = None
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect((self.host, self.port))
-        self._login()
-
-    def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
-
-    def __enter__(self):
-        self.connect()
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
-    # ── length encoding ───────────────────────────────────────────────────────
-
-    def _encode_length(self, length):
-        if length < 0x80:
-            return bytes([length])
-        elif length < 0x4000:
-            length |= 0x8000
-            return struct.pack("!H", length)
-        elif length < 0x200000:
-            length |= 0xC00000
-            return struct.pack("!I", length)[1:]
-        elif length < 0x10000000:
-            length |= 0xE0000000
-            return struct.pack("!I", length)
-        else:
-            return b'\xF0' + struct.pack("!I", length)
-
-    def _decode_length(self):
-        b = self._recv_exact(1)
-        first = b[0]
-        if first < 0x80:
-            return first
-        elif first < 0xC0:
-            second = self._recv_exact(1)[0]
-            return ((first & 0x3F) << 8) | second
-        elif first < 0xE0:
-            rest = self._recv_exact(2)
-            return ((first & 0x1F) << 16) | (rest[0] << 8) | rest[1]
-        elif first < 0xF0:
-            rest = self._recv_exact(3)
-            return ((first & 0x0F) << 24) | (rest[0] << 16) | (rest[1] << 8) | rest[2]
-        else:
-            rest = self._recv_exact(4)
-            return struct.unpack("!I", rest)[0]
-
-    def _recv_exact(self, n):
-        """Reads exactly n bytes or raises."""
-        data = b""
-        while len(data) < n:
-            chunk = self.sock.recv(n - len(data))
-            if not chunk:
-                raise ConnectionError("RouterOS API: connection closed")
-            data += chunk
-        return data
-
-    # ── protocol ──────────────────────────────────────────────────────────────
-
-    def _write_sentence(self, words):
-        data = b""
-        for word in words:
-            encoded = word.encode("utf-8")
-            data += self._encode_length(len(encoded)) + encoded
-        data += b"\x00"
-        self.sock.sendall(data)
-
-    def _read_sentence(self):
-        words = []
-        while True:
-            length = self._decode_length()
-            if length == 0:
-                break
-            word = self._recv_exact(length).decode("utf-8", errors="replace")
-            words.append(word)
-        return words
-
-    def _login(self):
-        self._write_sentence(["/login", f"=name={self.username}", f"=password={self.password}"])
-        response = self._read_sentence()
-        if response and response[0] == "!done":
-            return
-        # Legacy challenge-based login
-        challenge = None
-        for word in response:
-            if word.startswith("=ret="):
-                challenge = bytes.fromhex(word[5:])
-        if challenge:
-            md5 = hashlib.md5()
-            md5.update(b"\x00")
-            md5.update(self.password.encode("utf-8"))
-            md5.update(challenge)
-            self._write_sentence(["/login", f"=name={self.username}", f"=response=00{md5.hexdigest()}"])
-            self._read_sentence()
-
-    def _read_records(self):
-        """Reads !re records up to !done. Shared loop for query() and query_words()."""
-        results = []
-        while True:
-            sentence = self._read_sentence()
-            if not sentence:
-                break
-            tag = sentence[0]
-            if tag == "!re":
-                obj = {}
-                for word in sentence[1:]:
-                    if word.startswith("="):
-                        parts = word[1:].split("=", 1)
-                        if len(parts) == 2:
-                            obj[parts[0]] = parts[1]
-                results.append(obj)
-            elif tag == "!done":
-                break
-            elif tag in ("!trap", "!fatal"):
-                raise Exception(f"RouterOS error: {' '.join(sentence[1:])}")
-        return results
-
-    def query(self, command, params=None, filters=None):
-        """Runs a command and returns a list of dicts."""
-        words = [command]
-        if params:
-            for k, v in params.items():
-                words.append(f"={k}={v}")
-        if filters:
-            for f in filters:
-                words.append(f"?{f}")
-        self._write_sentence(words)
-        return self._read_records()
-
-    def query_words(self, words):
-        """Like query(), but takes a pre-built word list — needed for commands
-        with value-less flags (e.g. 'once' on /interface/monitor-traffic)."""
-        self._write_sentence(words)
-        return self._read_records()
-
-    def run(self, command, params=None):
-        """Runs a command without returning data (add/remove/set)."""
-        words = [command]
-        if params:
-            for k, v in params.items():
-                words.append(f"={k}={v}")
-        self._write_sentence(words)
-        while True:
-            sentence = self._read_sentence()
-            if not sentence:
-                break
-            tag = sentence[0]
-            if tag == "!done":
-                break
-            elif tag in ("!trap", "!fatal"):
-                raise Exception(f"RouterOS error: {' '.join(sentence[1:])}")
-
-
-_api_lock = threading.Lock()
-_api_instance = None
-_api_last_used = 0.0
-_API_IDLE_LIMIT = 480  # seconds — headroom below the router's own inactivity-timeout for this user
-
-
-class _PersistentApiHandle:
-    """Context manager that reuses one long-lived connection to the RouterOS API
-    instead of connect+login/close on every tool call (that pattern floods the
-    router's /log with a login/logout pair several times a second)."""
-
-    def __enter__(self):
-        global _api_instance, _api_last_used
-        _api_lock.acquire()
-        try:
-            now = time.time()
-            if _api_instance is not None and (now - _api_last_used) > _API_IDLE_LIMIT:
-                _api_instance.close()
-                _api_instance = None
-            if _api_instance is None:
-                _api_instance = RouterOSAPI(MIKROTIK_HOST, MIKROTIK_PORT, MIKROTIK_USER, MIKROTIK_PASS)
-                _api_instance.connect()
-            _api_last_used = now
-            return _api_instance
-        except Exception:
-            # __enter__ failed → __exit__ will NOT be called (that's how the
-            # `with` protocol works), so the lock must be released here or it
-            # stays held forever and every subsequent tool call (routed through
-            # run_in_threadpool) hangs until the whole thread pool is exhausted
-            # and the service stops responding entirely.
-            if _api_instance:
-                try:
-                    _api_instance.close()
-                except Exception:
-                    pass
-            _api_instance = None
-            _api_lock.release()
-            raise
-
-    def __exit__(self, exc_type, exc, tb):
-        global _api_instance
-        # Connection died (socket/timeout) — drop it so the next call reconnects
-        if exc_type is not None and issubclass(exc_type, (ConnectionError, OSError, socket.timeout)):
-            if _api_instance:
-                _api_instance.close()
-            _api_instance = None
-        _api_lock.release()
-        return False  # don't suppress the exception
-
+_api = PersistentRouterOSHandle(MIKROTIK_HOST, MIKROTIK_PORT, MIKROTIK_USER, MIKROTIK_PASS)
 
 def get_api():
-    return _PersistentApiHandle()
+    return _api
 
 
 # ─── Tool definitions ──────────────────────────────────────────────────────────
@@ -621,8 +399,18 @@ def run_tool(name, args):
 
         elif name == "execute_command":
             command = args["command"].strip()
+            # shlex instead of .split(): quoted values (comment="hello world")
+            # used to get split on whitespace into multiple broken words --
+            # .split() doesn't understand quoting, shlex.split() does.
+            try:
+                words = shlex.split(command)
+            except ValueError as e:
+                return {"error": f"Could not parse command: {e}"}
+            if not words:
+                return {"error": "Empty command"}
+
             # Determine the base command (first word)
-            base_cmd = command.split()[0].rstrip("/")
+            base_cmd = words[0].rstrip("/")
             # Normalize: /ping -> /ping, /ip/firewall/filter/print -> /ip/firewall/filter/print
             normalized = "/" + base_cmd.lstrip("/")
 
@@ -633,7 +421,6 @@ def run_tool(name, args):
                 }
 
             # Parse arguments: key=value -> params dict
-            words  = command.split()
             params = {}
             for word in words[1:]:
                 if "=" in word:
@@ -770,7 +557,7 @@ def validate_redirect_uri(uri: str):
 
 @app.get("/")
 async def root():
-    return {"status": "mikrotik-mcp running", "version": "1.3.0", "host": MIKROTIK_HOST}
+    return {"status": "mikrotik-mcp running", "version": "1.4.0", "host": MIKROTIK_HOST}
 
 
 @app.get("/mcp")
@@ -779,7 +566,7 @@ async def mcp_info(request: Request):
     return {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "mikrotik-mcp", "version": "1.3.0"}
+        "serverInfo": {"name": "mikrotik-mcp", "version": "1.4.0"}
     }
 
 
@@ -794,7 +581,7 @@ async def mcp_handler(request: Request):
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "mikrotik-mcp", "version": "1.3.0"}
+            "serverInfo": {"name": "mikrotik-mcp", "version": "1.4.0"}
         }})
 
     elif method == "notifications/initialized":
