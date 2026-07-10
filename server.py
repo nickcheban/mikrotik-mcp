@@ -427,6 +427,17 @@ def run_tool(name, args):
                     k, v = word.split("=", 1)
                     params[k] = v
 
+            # /ping and /tool/ping without a count ping forever and never send
+            # !done -- query() would hang, holding the persistent connection's
+            # lock forever and freezing every other call to this server.
+            # Force a bounded count (default 4, max 20).
+            if normalized in ("/ping", "/tool/ping"):
+                try:
+                    count = int(params.get("count", 4))
+                except ValueError:
+                    count = 4
+                params["count"] = str(max(1, min(count, 20)))
+
             result = api.query(normalized, params if params else None)
             return {"command": command, "result": result, "count": len(result)}
 
